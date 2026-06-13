@@ -89,7 +89,7 @@ Main signal: Review time is above the 24h target.
 Recommended action: Introduce a rotating review owner for platform-related PRs next week.
 ```
 
-See `examples/slack-output-example.md` for a full generated report.
+See `output/weekly leadership summary.pdf` for a full generated report (I used AI to create a pdf from the actual report so you dont have to study the raw markdown)
 
 ## How to make it live
 
