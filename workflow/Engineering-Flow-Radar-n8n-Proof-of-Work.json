@@ -1,0 +1,142 @@
+{
+  "name": "Engineering Flow Radar — n8n Proof of Work (Demo)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "735bba67-4c05-4299-b07b-67c1b5745322",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Run Once for All Items\n// Calculates engineering flow metrics from normalized issue/PR records.\n\nconst inputItems = $input.all();\nconst records = inputItems.map(item => item.json);\n\nconst reportStart = new Date('2026-06-08T00:00:00Z');\nconst reportEnd = new Date('2026-06-15T00:00:00Z');\nconst previousStart = new Date(reportStart.getTime() - 7 * 24 * 60 * 60 * 1000);\nconst now = new Date('2026-06-13T17:00:00Z');\n\nconst DAY_MS = 24 * 60 * 60 * 1000;\nconst HOUR_MS = 60 * 60 * 1000;\n\nfunction parseDate(value) {\n  return value ? new Date(value) : null;\n}\n\nfunction daysBetween(start, end) {\n  if (!start || !end) return null;\n  return Math.round(((end - start) / DAY_MS) * 10) / 10;\n}\n\nfunction hoursBetween(start, end) {\n  if (!start || !end) return null;\n  return Math.round(((end - start) / HOUR_MS) * 10) / 10;\n}\n\nfunction inRange(date, start, end) {\n  return date && date >= start && date < end;\n}\n\nfunction percentile(values, p) {\n  if (!values.length) return null;\n  const sorted = [...values].sort((a, b) => a - b);\n  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));\n  return sorted[idx];\n}\n\nfunction median(values) {\n  if (!values.length) return null;\n  const sorted = [...values].sort((a, b) => a - b);\n  const mid = Math.floor(sorted.length / 2);\n  if (sorted.length % 2) return sorted[mid];\n  return Math.round(((sorted[mid - 1] + sorted[mid]) / 2) * 10) / 10;\n}\n\nfunction average(values) {\n  if (!values.length) return null;\n  return Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 10) / 10;\n}\n\nfunction pctChange(current, previous) {\n  if (previous === null || previous === undefined || previous === 0 || current === null || current === undefined) return null;\n  return Math.round(((current - previous) / previous) * 100);\n}\n\nfunction formatTrend(value) {\n  if (value === null || value === undefined) return 'n/a';\n  if (value > 0) return `+${value}%`;\n  return `${value}%`;\n}\n\nconst enriched = records.map(record => {\n  const startedAt = parseDate(record.startedAt) || parseDate(record.createdAt);\n  const completedAt = parseDate(record.completedAt);\n  const prOpenedAt = parseDate(record.prOpenedAt);\n  const prMergedAt = parseDate(record.prMergedAt);\n  const cycleTimeDays = completedAt ? daysBetween(startedAt, completedAt) : null;\n  const reviewTimeHours = prMergedAt ? hoursBetween(prOpenedAt, prMergedAt) : (prOpenedAt ? hoursBetween(prOpenedAt, now) : null);\n  const ageDays = !completedAt && startedAt ? daysBetween(startedAt, now) : null;\n  return { ...record, cycleTimeDays, reviewTimeHours, ageDays };\n});\n\nconst completedThisWeek = enriched.filter(record => inRange(parseDate(record.completedAt), reportStart, reportEnd));\nconst completedPreviousWeek = enriched.filter(record => inRange(parseDate(record.completedAt), previousStart, reportStart));\nconst activeItems = enriched.filter(record => record.status !== 'Done');\n\nconst thisCycleTimes = completedThisWeek.map(record => record.cycleTimeDays).filter(value => value !== null);\nconst prevCycleTimes = completedPreviousWeek.map(record => record.cycleTimeDays).filter(value => value !== null);\nconst thisReviewTimes = completedThisWeek.map(record => record.reviewTimeHours).filter(value => value !== null);\nconst prevReviewTimes = completedPreviousWeek.map(record => record.reviewTimeHours).filter(value => value !== null);\n\nconst blockedItems = enriched.filter(record => (record.blockedDays || 0) > 0 && (record.status !== 'Done' || inRange(parseDate(record.completedAt), reportStart, reportEnd)));\nconst agingWip = activeItems.filter(record => (record.ageDays || 0) >= 5);\nconst reviewQueue = activeItems.filter(record => record.prOpenedAt && !record.prMergedAt);\n\nconst metrics = {\n  reportWindow: {\n    start: reportStart.toISOString().slice(0, 10),\n    endExclusive: reportEnd.toISOString().slice(0, 10)\n  },\n  throughput: {\n    current: completedThisWeek.length,\n    previous: completedPreviousWeek.length,\n    trend: formatTrend(pctChange(completedThisWeek.length, completedPreviousWeek.length))\n  },\n  cycleTimeDays: {\n    median: median(thisCycleTimes),\n    p95: percentile(thisCycleTimes, 95),\n    previousMedian: median(prevCycleTimes),\n    medianTrend: formatTrend(pctChange(median(thisCycleTimes), median(prevCycleTimes))),\n    samples: thisCycleTimes\n  },\n  reviewTimeHours: {\n    average: average(thisReviewTimes),\n    p95: percentile(thisReviewTimes, 95),\n    previousAverage: average(prevReviewTimes),\n    averageTrend: formatTrend(pctChange(average(thisReviewTimes), average(prevReviewTimes))),\n    openReviewQueue: reviewQueue.length\n  },\n  blocked: {\n    count: blockedItems.length,\n    totalBlockedDays: Math.round(blockedItems.reduce((sum, record) => sum + (record.blockedDays || 0), 0) * 10) / 10,\n    items: blockedItems.map(record => ({ id: record.id, title: record.title, reason: record.blockerReason, blockedDays: record.blockedDays, status: record.status }))\n  },\n  wip: {\n    active: activeItems.length,\n    aging: agingWip.length,\n    agingItems: agingWip.map(record => ({ id: record.id, title: record.title, ageDays: record.ageDays, status: record.status }))\n  }\n};\n\nconst findings = [];\n\nif ((metrics.reviewTimeHours.average || 0) > 24) {\n  findings.push({\n    severity: 'High',\n    signal: 'Review time is above the 24h target',\n    likelyCause: 'Platform/backend review capacity is the current constraint.',\n    action: 'Introduce a rotating review owner for platform-related PRs next week.'\n  });\n}\n\nif ((metrics.cycleTimeDays.p95 || 0) > (metrics.cycleTimeDays.median || 0) * 2.5) {\n  findings.push({\n    severity: 'Medium',\n    signal: 'P95 cycle time is much higher than median cycle time',\n    likelyCause: 'A few large or dependency-heavy items are creating a long tail.',\n    action: 'Split high-complexity items earlier and review blocked work in the weekly planning check.'\n  });\n}\n\nif (metrics.blocked.count >= 3) {\n  findings.push({\n    severity: 'Medium',\n    signal: `${metrics.blocked.count} items show blocker time this week`,\n    likelyCause: 'Cross-team dependencies and unresolved platform decisions are slowing flow.',\n    action: 'Create an explicit dependency board and review it twice weekly until blocker count drops below three.'\n  });\n}\n\nif (metrics.wip.aging > 0) {\n  findings.push({\n    severity: 'Medium',\n    signal: `${metrics.wip.aging} active item(s) have been in progress for five or more days`,\n    likelyCause: 'Work is aging in the system before reaching Done.',\n    action: 'Swarm on the oldest WIP item before pulling new work.'\n  });\n}\n\nif (!findings.length) {\n  findings.push({\n    severity: 'Low',\n    signal: 'No major flow risk detected',\n    likelyCause: 'Throughput, cycle time, and WIP are within expected range.',\n    action: 'Keep monitoring review time and blocked work for early warning signals.'\n  });\n}\n\nreturn [{\n  json: {\n    generatedAt: now.toISOString(),\n    inputRecords: records.length,\n    metrics,\n    findings,\n    completedThisWeek: completedThisWeek.map(record => ({ id: record.id, title: record.title, cycleTimeDays: record.cycleTimeDays, reviewTimeHours: record.reviewTimeHours, blockedDays: record.blockedDays })),\n    activeItems: activeItems.map(record => ({ id: record.id, title: record.title, status: record.status, ageDays: record.ageDays, reviewTimeHours: record.reviewTimeHours, blockedDays: record.blockedDays }))\n  }\n}];\n"
+      },
+      "id": "fed71296-d94a-4c20-9429-bd0e09e7db8a",
+      "name": "Calculate Flow Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        0
+      ],
+      "notes": "Computes throughput, median/P95 cycle time, PR review time, blockers, and aging WIP."
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Run Once for All Items\n// Generates fictional Jira/Linear + GitHub-style engineering flow data.\n// No credentials required. For live use, swap this node for integrations.\n\nconst issues = [\n  {\n    id: 'ENG-241',\n    title: 'Harden workflow execution retry logic',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Feature',\n    priority: 'High',\n    status: 'Done',\n    createdAt: '2026-06-01T09:10:00Z',\n    startedAt: '2026-06-03T09:30:00Z',\n    completedAt: '2026-06-09T15:20:00Z',\n    prOpenedAt: '2026-06-06T13:40:00Z',\n    prMergedAt: '2026-06-09T14:55:00Z',\n    blockedDays: 1.0,\n    blockerReason: 'Waiting for platform review',\n    storyPoints: 5\n  },\n  {\n    id: 'ENG-242',\n    title: 'Improve credential validation error messages',\n    team: 'Frontend Platform',\n    owner: 'Frontend',\n    type: 'Bug',\n    priority: 'Medium',\n    status: 'Done',\n    createdAt: '2026-06-04T10:00:00Z',\n    startedAt: '2026-06-05T08:45:00Z',\n    completedAt: '2026-06-10T11:00:00Z',\n    prOpenedAt: '2026-06-09T10:00:00Z',\n    prMergedAt: '2026-06-10T10:40:00Z',\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 3\n  },\n  {\n    id: 'ENG-243',\n    title: 'Add execution-health telemetry for long-running workflows',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Feature',\n    priority: 'High',\n    status: 'Done',\n    createdAt: '2026-05-28T12:15:00Z',\n    startedAt: '2026-06-02T09:00:00Z',\n    completedAt: '2026-06-12T16:30:00Z',\n    prOpenedAt: '2026-06-05T17:20:00Z',\n    prMergedAt: '2026-06-12T16:00:00Z',\n    blockedDays: 2.5,\n    blockerReason: 'Telemetry schema decision',\n    storyPoints: 8\n  },\n  {\n    id: 'ENG-244',\n    title: 'Refactor canvas state management boundary',\n    team: 'Frontend Platform',\n    owner: 'Frontend',\n    type: 'Tech Debt',\n    priority: 'Medium',\n    status: 'Done',\n    createdAt: '2026-06-05T09:00:00Z',\n    startedAt: '2026-06-06T09:00:00Z',\n    completedAt: '2026-06-11T12:10:00Z',\n    prOpenedAt: '2026-06-10T10:05:00Z',\n    prMergedAt: '2026-06-11T11:50:00Z',\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 5\n  },\n  {\n    id: 'ENG-245',\n    title: 'Reduce noisy execution logs for successful retries',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Bug',\n    priority: 'Low',\n    status: 'Done',\n    createdAt: '2026-06-09T08:10:00Z',\n    startedAt: '2026-06-09T09:00:00Z',\n    completedAt: '2026-06-10T13:00:00Z',\n    prOpenedAt: '2026-06-10T08:00:00Z',\n    prMergedAt: '2026-06-10T12:50:00Z',\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 2\n  },\n  {\n    id: 'ENG-246',\n    title: 'Improve webhook timeout handling',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Feature',\n    priority: 'High',\n    status: 'Done',\n    createdAt: '2026-05-30T11:40:00Z',\n    startedAt: '2026-06-04T09:00:00Z',\n    completedAt: '2026-06-13T09:10:00Z',\n    prOpenedAt: '2026-06-10T14:30:00Z',\n    prMergedAt: '2026-06-13T08:55:00Z',\n    blockedDays: 1.5,\n    blockerReason: 'Cross-team API contract',\n    storyPoints: 8\n  },\n  {\n    id: 'ENG-247',\n    title: 'Make workflow history filters keyboard accessible',\n    team: 'Frontend Platform',\n    owner: 'Frontend',\n    type: 'Feature',\n    priority: 'Medium',\n    status: 'Done',\n    createdAt: '2026-06-02T14:20:00Z',\n    startedAt: '2026-06-03T10:00:00Z',\n    completedAt: '2026-06-05T16:30:00Z',\n    prOpenedAt: '2026-06-04T15:00:00Z',\n    prMergedAt: '2026-06-05T16:10:00Z',\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 3\n  },\n  {\n    id: 'ENG-248',\n    title: 'Add smoke checks for platform package releases',\n    team: 'Core Platform',\n    owner: 'QA/Platform',\n    type: 'Quality',\n    priority: 'Medium',\n    status: 'Done',\n    createdAt: '2026-06-01T08:00:00Z',\n    startedAt: '2026-06-02T08:30:00Z',\n    completedAt: '2026-06-06T10:00:00Z',\n    prOpenedAt: '2026-06-04T09:10:00Z',\n    prMergedAt: '2026-06-06T09:40:00Z',\n    blockedDays: 0.5,\n    blockerReason: 'CI permissions',\n    storyPoints: 3\n  },\n  {\n    id: 'ENG-249',\n    title: 'Stabilize node package dependency updates',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Tech Debt',\n    priority: 'Medium',\n    status: 'In Progress',\n    createdAt: '2026-06-02T13:00:00Z',\n    startedAt: '2026-06-04T09:00:00Z',\n    completedAt: null,\n    prOpenedAt: '2026-06-11T14:00:00Z',\n    prMergedAt: null,\n    blockedDays: 2.0,\n    blockerReason: 'Breaking test fixture',\n    storyPoints: 8\n  },\n  {\n    id: 'ENG-250',\n    title: 'Improve execution-list rendering performance',\n    team: 'Frontend Platform',\n    owner: 'Frontend',\n    type: 'Feature',\n    priority: 'High',\n    status: 'In Review',\n    createdAt: '2026-06-03T09:30:00Z',\n    startedAt: '2026-06-05T09:30:00Z',\n    completedAt: null,\n    prOpenedAt: '2026-06-12T13:00:00Z',\n    prMergedAt: null,\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 5\n  },\n  {\n    id: 'ENG-251',\n    title: 'Document platform API compatibility guarantees',\n    team: 'Core Platform',\n    owner: 'Tech Lead',\n    type: 'Documentation',\n    priority: 'Medium',\n    status: 'Blocked',\n    createdAt: '2026-05-27T09:00:00Z',\n    startedAt: '2026-06-03T09:00:00Z',\n    completedAt: null,\n    prOpenedAt: null,\n    prMergedAt: null,\n    blockedDays: 4.0,\n    blockerReason: 'Decision needed from product/engineering',\n    storyPoints: 3\n  },\n  {\n    id: 'ENG-252',\n    title: 'Remove legacy execution-status branch',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Tech Debt',\n    priority: 'Low',\n    status: 'Backlog',\n    createdAt: '2026-06-11T10:00:00Z',\n    startedAt: null,\n    completedAt: null,\n    prOpenedAt: null,\n    prMergedAt: null,\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 2\n  },\n  {\n    id: 'ENG-230',\n    title: 'Add workflow execution pagination guardrails',\n    team: 'Core Platform',\n    owner: 'Backend',\n    type: 'Feature',\n    priority: 'Medium',\n    status: 'Done',\n    createdAt: '2026-05-24T09:00:00Z',\n    startedAt: '2026-05-27T09:00:00Z',\n    completedAt: '2026-06-03T11:00:00Z',\n    prOpenedAt: '2026-06-02T09:00:00Z',\n    prMergedAt: '2026-06-03T10:30:00Z',\n    blockedDays: 0.5,\n    blockerReason: 'API limit decision',\n    storyPoints: 5\n  },\n  {\n    id: 'ENG-231',\n    title: 'Simplify onboarding copy for self-hosted setup',\n    team: 'Frontend Platform',\n    owner: 'Frontend',\n    type: 'UX',\n    priority: 'Low',\n    status: 'Done',\n    createdAt: '2026-05-30T09:00:00Z',\n    startedAt: '2026-06-01T08:30:00Z',\n    completedAt: '2026-06-04T16:00:00Z',\n    prOpenedAt: '2026-06-03T09:30:00Z',\n    prMergedAt: '2026-06-04T15:45:00Z',\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 3\n  },\n  {\n    id: 'ENG-232',\n    title: 'Patch flaky release workflow test',\n    team: 'Core Platform',\n    owner: 'QA/Platform',\n    type: 'Bug',\n    priority: 'High',\n    status: 'Done',\n    createdAt: '2026-06-01T10:00:00Z',\n    startedAt: '2026-06-02T10:00:00Z',\n    completedAt: '2026-06-06T12:00:00Z',\n    prOpenedAt: '2026-06-05T11:00:00Z',\n    prMergedAt: '2026-06-06T11:40:00Z',\n    blockedDays: 0,\n    blockerReason: '',\n    storyPoints: 2\n  }\n];\n\nreturn issues.map(issue => ({ json: issue }));\n"
+      },
+      "id": "6dce50e4-211b-4afa-ba91-28ed5bdd2d0c",
+      "name": "Generate Sample Engineering Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        288,
+        0
+      ],
+      "notes": "Sample input only. For live use, connect Jira/Linear/GitHub data sources here."
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Run Once for All Items\n// Creates a deterministic, rule-based weekly leadership summary.\n\nconst data = $input.all()[0].json;\nconst { metrics, findings } = data;\nconst topFinding = findings[0];\n\nfunction valueOrNA(value, suffix = '') {\n  return value === null || value === undefined ? 'n/a' : `${value}${suffix}`;\n}\n\nconst blockedList = metrics.blocked.items.length\n  ? metrics.blocked.items\n      .slice(0, 4)\n      .map(item => `- ${item.id}: ${item.reason || 'No reason captured'} (${item.blockedDays}d, ${item.status})`)\n      .join('\\n')\n  : '- None';\n\nconst agingList = metrics.wip.agingItems.length\n  ? metrics.wip.agingItems\n      .map(item => `- ${item.id}: ${item.title} (${item.ageDays}d, ${item.status})`)\n      .join('\\n')\n  : '- None';\n\nconst reportMarkdown = `# Weekly Engineering Flow Radar\n\n**Window:** ${metrics.reportWindow.start} to ${metrics.reportWindow.endExclusive}  \n**Input records:** ${data.inputRecords}\n\n## Scorecard\n\n| Metric | Current | Trend |\n|---|---:|---:|\n| Throughput | ${metrics.throughput.current} completed items | ${metrics.throughput.trend} |\n| Median cycle time | ${valueOrNA(metrics.cycleTimeDays.median, 'd')} | ${metrics.cycleTimeDays.medianTrend} |\n| P95 cycle time | ${valueOrNA(metrics.cycleTimeDays.p95, 'd')} | — |\n| Avg PR review time | ${valueOrNA(metrics.reviewTimeHours.average, 'h')} | ${metrics.reviewTimeHours.averageTrend} |\n| Open review queue | ${metrics.reviewTimeHours.openReviewQueue} PR(s) | — |\n| Blocked items | ${metrics.blocked.count} | ${metrics.blocked.totalBlockedDays} blocked days |\n| Aging WIP | ${metrics.wip.aging} of ${metrics.wip.active} active items | — |\n\n## Main signal\n\n**${topFinding.signal}.** ${topFinding.likelyCause}\n\n## Recommended management action\n\n${topFinding.action}\n\n## Secondary risks\n\n${findings.slice(1).map(finding => `- **${finding.severity}:** ${finding.signal}. Action: ${finding.action}`).join('\\n') || '- No secondary risks detected.'}\n\n## Blocked work\n\n${blockedList}\n\n## Aging WIP\n\n${agingList}\n\n---\nDemo report produced by the n8n workflow in this repository using sample GitHub/Jira/Linear-style engineering flow data.`;\n\nconst slackBlock = `*Weekly Engineering Flow Radar*\\n\\n*Window:* ${metrics.reportWindow.start} to ${metrics.reportWindow.endExclusive}\\n*Throughput:* ${metrics.throughput.current} completed items (${metrics.throughput.trend})\\n*Median cycle time:* ${valueOrNA(metrics.cycleTimeDays.median, 'd')} (${metrics.cycleTimeDays.medianTrend})\\n*P95 cycle time:* ${valueOrNA(metrics.cycleTimeDays.p95, 'd')}\\n*Avg PR review time:* ${valueOrNA(metrics.reviewTimeHours.average, 'h')} (${metrics.reviewTimeHours.averageTrend})\\n*Blocked items:* ${metrics.blocked.count}\\n*Aging WIP:* ${metrics.wip.aging}\\n\\n*Main signal:* ${topFinding.signal}.\\n*Likely cause:* ${topFinding.likelyCause}\\n*Recommended action:* ${topFinding.action}`;\n\nreturn [{\n  json: {\n    reportMarkdown,\n    slackBlock,\n    headline: topFinding.signal,\n    recommendedAction: topFinding.action,\n    metrics,\n    findings\n  }\n}];\n"
+      },
+      "id": "083c319f-8f4b-43bf-b038-dc34599bb505",
+      "name": "Generate Engineering Leadership Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ],
+      "notes": "Creates Markdown and Slack-ready report text."
+    },
+    {
+      "parameters": {
+        "content": "1. Demo version uses sample data.\n2. Live version can connect GitHub + Jira / Linear inputs.\n3. Metrics mirror the operating system I use as Head of Engineering: throughput, cycle time, P95, blockers, review delay.",
+        "height": 128,
+        "width": 512
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        128,
+        224
+      ],
+      "typeVersion": 1,
+      "id": "d13370ca-855e-42a3-927e-e7d685ea6bdf",
+      "name": "Sticky Note"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Generate Sample Engineering Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Flow Metrics": {
+      "main": [
+        [
+          {
+            "node": "Generate Engineering Leadership Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Sample Engineering Data": {
+      "main": [
+        [
+          {
+            "node": "Calculate Flow Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "6b736664-be90-48b7-aec2-9a2d1b10c2ec",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "cea4e857e953af6c1424d432e0bdf4963436834dc04e111da9bb404d5e38ad71"
+  },
+  "nodeGroups": [],
+  "id": "cDMA5VWDUQsfcSaj",
+  "tags": [
+    {
+      "updatedAt": "2026-06-13T18:47:49.853Z",
+      "createdAt": "2026-06-13T18:47:49.853Z",
+      "id": "QjSrnqJoCUrbDifV",
+      "name": "proof-of-work"
+    },
+    {
+      "updatedAt": "2026-06-13T18:47:49.818Z",
+      "createdAt": "2026-06-13T18:47:49.818Z",
+      "id": "Yd4lcgPl4ogXm55P",
+      "name": "engineering-leadership"
+    },
+    {
+      "updatedAt": "2026-06-13T18:47:49.825Z",
+      "createdAt": "2026-06-13T18:47:49.825Z",
+      "id": "Z81t0aIBYPNSdW3l",
+      "name": "demo"
+    }
+  ]
+}
